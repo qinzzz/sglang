@@ -468,7 +468,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
-        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams, int]] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -1822,6 +1822,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
 
+        # Throttle L3 write queueing: cap host-locked tokens to avoid starving host
+        # eviction when the store is slower than prefill (issue #52891).
+        cc = self.cache_controller
+        kv_tokens = len(node.component_data[BASE_COMPONENT_TYPE].host_value)
+        if cc.backup_rate_limited(kv_tokens):
+            return
+
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
@@ -1855,9 +1862,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        cc.backup_tokens_occupied += kv_tokens
         self.ongoing_backup[operation_id] = (
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
+            kv_tokens,
         )
 
     def prefetch_from_storage(
@@ -2161,7 +2170,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 drained += 1
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
-                    node, lock_params = entry
+                    node, lock_params, kv_tokens = entry
+                    cc.backup_tokens_occupied -= kv_tokens
                     self.dec_host_lock_ref(node, lock_params)
                 if (
                     log_metrics

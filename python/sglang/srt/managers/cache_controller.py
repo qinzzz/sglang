@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 
@@ -467,6 +468,10 @@ class HiCacheController:
             self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
+            # Budget backup (write-through) at half the host pool to prevent host eviction starvation.
+            self.backup_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            # tracking the number of tokens locked by in-flight L3 writes, updated by the main scheduler thread
+            self.backup_tokens_occupied = 0
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -639,6 +644,7 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+            self.backup_tokens_occupied = 0
 
         self.storage_stop_event.clear()
 
@@ -990,6 +996,12 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def backup_rate_limited(self, kv_tokens: int) -> bool:
+        """
+        Throttle L3 write queueing so in-flight writes never starve host eviction.
+        """
+        return self.backup_tokens_occupied + kv_tokens > self.backup_capacity_limit
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -1192,6 +1204,10 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+
+                delay = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY.get()
+                if delay > 0:
+                    time.sleep(delay)
 
                 if not self.backup_skip:
                     self._page_backup(operation)
